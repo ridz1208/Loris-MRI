@@ -1,9 +1,10 @@
 """This class gather functions for candidate handling."""
 
 import random
-from dateutil.parser import parse
-import lib.exitcode
 import sys
+
+import lib.exitcode
+from lib.import_bids_dataset.participant import BidsParticipant
 
 __license__ = "GPLv3"
 
@@ -57,42 +58,47 @@ class Candidate:
         self.center_id  = None
         self.project_id = None
 
-    def create_candidate(self, db, participants_info):
+    def create_candidate(self, db, bids_participants: list[BidsParticipant]):
         """
         Creates a candidate using BIDS information provided in the
-        participants_info's list.
+        bids_participants's list.
 
         :param db               : database handler object
          :type db               : object
-        :param participants_info: list of dictionary with participants
+        :param bids_participants: list of dictionary with participants
                                   information from BIDS
-         :type participants_info: list
 
         :return: dictionary with candidate info from the candidate's table
          :rtype: dict
         """
 
-        self.cand_id = self.generate_cand_id(db)
+        if not self.psc_id:
+            print("Cannot create a candidate without a PSCID.\n")
+            sys.exit(lib.exitcode.CANDIDATE_CREATION_FAILURE)
 
-        for row in participants_info:
-            if not row['participant_id'] == self.psc_id:
+        if not self.cand_id:
+            self.cand_id = self.generate_cand_id(db)
+
+        for bids_participant in bids_participants:
+            if bids_participant.id != self.psc_id:
                 continue
-            self.grep_bids_dob(row)
-            if 'sex' in row:
-                self.map_sex(row['sex'])
-            if 'age' in row:
-                self.age = row['age']
+
+            self.dob = bids_participant.birth_date
+            if bids_participant.sex is not None:
+                self.map_sex(bids_participant.sex)
+            if bids_participant.age is not None:
+                self.age = bids_participant.age
 
             # three steps to find site:
             #   1. try matching full name from 'site' column in participants.tsv in db
             #   2. try extracting alias from pscid
             #   3. try finding previous site in candidate table
 
-            if 'site' in row and row['site'].lower() not in ("null", ""):
+            if bids_participant.site is not None and bids_participant.site.lower() not in ('', 'null'):
                 # search site id in psc table by its full name
                 site_info = db.pselect(
                     "SELECT CenterID FROM psc WHERE Name = %s",
-                    [row['site'], ]
+                    [bids_participant.site, ]
                 )
                 if len(site_info) > 0:
                     self.center_id = site_info[0]['CenterID']
@@ -101,7 +107,7 @@ class Candidate:
                 # search site id in psc table by its alias extracted from pscid
                 db_sites = db.pselect("SELECT CenterID, Alias FROM psc")
                 for site in db_sites:
-                    if site['Alias'] in row['participant_id']:
+                    if site['Alias'] in bids_participant.id:
                         self.center_id = site['CenterID']
 
             if self.center_id is None:
@@ -117,11 +123,11 @@ class Candidate:
             #   1. find full name in 'project' column in participants.tsv
             #   2. find previous in candidate table
 
-            if 'project' in row and row['project'].lower() not in ("null", ""):
+            if bids_participant.project is not None and bids_participant.project.lower() not in ('', 'null'):
                 # search project id in Project table by its full name
                 project_info = db.pselect(
                     "SELECT ProjectID FROM Project WHERE Name = %s",
-                    [row['project'], ]
+                    [bids_participant.project, ]
                 )
                 if len(project_info) > 0:
                     self.project_id = project_info[0]['ProjectID']
@@ -171,13 +177,11 @@ class Candidate:
             values=insert_val
         )
 
-        loris_cand_info = self.get_candidate_info_from_loris(db)
-
-        return loris_cand_info
+        return self.get_candidate_info_from_loris(db)
 
     def get_candidate_info_from_loris(self, db):
         """
-        Grep candidate information from the candidate table using PSCID.
+        Grep candidate information from the candidate table using the PSCID or CandID.
 
         :param db: database handler object
          :type db: object
@@ -186,10 +190,17 @@ class Candidate:
          :rtype: dict
         """
 
-        loris_cand_info = db.pselect(
-            "SELECT * FROM candidate WHERE PSCID = %s",
-            (self.psc_id,),
-        )
+        loris_cand_info = None
+        if self.cand_id:
+            loris_cand_info = db.pselect(
+                "SELECT * FROM candidate WHERE CandID = %s",
+                (self.cand_id,),
+            )
+        elif self.psc_id:
+            loris_cand_info = db.pselect(
+                "SELECT * FROM candidate WHERE PSCID = %s",
+                (self.psc_id,),
+            )
 
         return loris_cand_info[0] if loris_cand_info else None
 
@@ -208,22 +219,6 @@ class Candidate:
         if sex.lower() in ('f', 'female'):
             self.sex = 'Female'
 
-    def grep_bids_dob(self, subject_info):
-        """
-        Greps the date of birth from the BIDS structure and add it to self.dob which
-        will be inserted into the DoB field of the candidate table
-
-        :param subject_info: dictionary with all information present in the BIDS
-                             participants.tsv file for a given candidate
-         :type subject_info: dict
-        """
-
-        dob_names = ['date_of_birth', 'birth_date', 'dob']
-        for name in dob_names:
-            if name in subject_info:
-                dob   = parse(subject_info[name])
-                self.dob = dob.strftime('%Y-%m-%d')
-
     @staticmethod
     def generate_cand_id(db):
         """
@@ -239,7 +234,7 @@ class Candidate:
 
         id = random.randint(100000, 999999)
 
-        while(db.pselect("SELECT * FROM candidate WHERE CandID = %s", (id,))):
+        while db.pselect("SELECT * FROM candidate WHERE CandID = %s", (id,)):
             # pick a new id
             id = random.randint(100000, 999999)
 

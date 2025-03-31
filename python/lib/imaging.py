@@ -6,9 +6,9 @@ import json
 import nibabel as nib
 import re
 import tarfile
+from hashlib import blake2b
 
 from nilearn import image, plotting
-from pyblake2 import blake2b
 
 from lib.database_lib.config import Config
 from lib.database_lib.files import Files
@@ -1031,7 +1031,7 @@ class Imaging:
             sorted_files_list = sorted(new_files_list, key=lambda x: x['acq_time'])
         except TypeError:
             return None
-        
+
         return sorted_files_list
 
     def modify_fmap_json_file_to_write_intended_for(self, sorted_fmap_files_list, s3_obj, tmp_dir):

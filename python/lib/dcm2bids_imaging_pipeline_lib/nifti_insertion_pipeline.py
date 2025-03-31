@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 from lib.dcm2bids_imaging_pipeline_lib.base_pipeline import BasePipeline
-from pyblake2 import blake2b
+from hashlib import blake2b
 
 __license__ = "GPLv3"
 
