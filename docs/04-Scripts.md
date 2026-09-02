@@ -152,7 +152,7 @@ Note carefully the following arguments:
 ### 4.3.2 Rerunning the Imaging pipeline
 
 - If one of the final steps such as the MINC (or BIDS) conversion is failing, you may
-    wish to just re-run the `tarchiveLoader.pl` (or `run_dicom_archive_loader.py`) script.
+    wish to just re-run the `tarchiveLoader.pl` (or `convert-dicom-archive-to-bids`) command.
     
 > When the need arises to re-load imaging data in LORIS, it is generally not
    sufficient to just re-run the MINC/NIfTI loading step (`tarchiveLoader.pl` or

@@ -1,5 +1,7 @@
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import Engine
@@ -37,10 +39,28 @@ class Env:
     db: Session
     script_name: str
     config_info: Any
-    log_file: str
+    tmp_dir_path: Path
+    log_file_path: Path | None
     verbose: bool
     cleanups: list[Callable[[], None]]
     notifier: Notifier | None = None
+
+    def close(self):
+        """
+        Close the environment resources and remove its temporary directory. It is not required to
+        manually call this method in processes that only have a single long-lived environment. But
+        it is advised to do so in processes that manage multiple short-lived environments.
+        """
+
+        try:
+            if self.notifier is not None:
+                self.notifier.db.close()
+        finally:
+            try:
+                self.db.close()
+            finally:
+                self.db_engine.dispose()
+                shutil.rmtree(self.tmp_dir_path, ignore_errors=True)
 
     def add_cleanup(self, cleanup: Callable[[], None]):
         """
@@ -71,8 +91,7 @@ class Env:
         notification_type = try_get_notification_type_with_name(notification_db, notification_type_name)
         if notification_type is None:
             notification_type = DbNotificationType(
-                name    = notification_type_name,
-                private = False,
+                name = notification_type_name,
             )
 
             notification_db.add(notification_type)

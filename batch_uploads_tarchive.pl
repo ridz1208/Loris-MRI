@@ -250,8 +250,7 @@ foreach my $input (@inputs)
     } elsif ($converter =~ m/dcm2niix/i) {
         my $python_config = $configOB->getPythonConfigFile();
             $command = sprintf(
-            "%s/python/run_dicom_archive_loader.py -p %s -t %s",
-            quotemeta($bin_dirPath),
+            "convert-dicom-archive-to-bids -p %s -t %s",
             $python_config,
             quotemeta($tarchive_path)
         );

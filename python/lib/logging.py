@@ -65,7 +65,10 @@ def write_to_log_file(env: Env, message: str):
     Write a message to the log file of the environment.
     """
 
-    with open(env.log_file, 'a') as file:
+    if env.log_file_path is None:
+        return
+
+    with open(env.log_file_path, 'a') as file:
         file.write(f"{message}\n")
 
 
@@ -86,8 +89,6 @@ def register_notification(env: Env, message: str, is_error: bool, is_verbose: bo
         process_id   = env.notifier.process_id,
         error        = is_error,
         verbose      = is_verbose,
-        sent         = False,
-        active       = True,
     )
 
     env.notifier.db.add(notification)

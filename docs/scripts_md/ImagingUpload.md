@@ -92,7 +92,7 @@ RETURNS: 1 on success, 0 on failure
 
 ### runPythonArchiveLoader()
 
-This methods will call `run_dicom_archive_loader.py`
+This method will call `convert-dicom-archive-to-bids`
 
 RETURNS: 1 on success, 0 on failure
 

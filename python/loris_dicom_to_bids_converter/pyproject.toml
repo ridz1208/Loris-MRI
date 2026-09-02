@@ -1,0 +1,33 @@
+[project]
+name = "loris-dicom-to-bids-converter"
+version = "29.0.0"
+description = "The LORIS DICOM-to-BIDS converter"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">= 3.11"
+dependencies = [
+    "loris-bids-importer",
+    "loris-bids-utils",
+    "loris-utils",
+    "sqlalchemy",
+]
+
+[project.scripts]
+convert-dicom-archive-to-bids = "loris_dicom_to_bids_converter.scripts.convert_dicom_archive_to_bids:main"
+validate-dicom-archive        = "loris_dicom_to_bids_converter.scripts.validate_dicom_archive:main"
+insert-nifti                  = "loris_dicom_to_bids_converter.scripts.insert_nifti:main"
+push-imaging-files-to-s3      = "loris_dicom_to_bids_converter.scripts.push_imaging_files_to_s3:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loris_dicom_to_bids_converter"]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+src = ["src"]
