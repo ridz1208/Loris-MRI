@@ -8,11 +8,8 @@
 - physiological_coord_system_point_3d_rel
 """
 
-from typing import Dict, List
 # from lib.point_3d import Point3D
 # from lib.database_lib.point_3d import Point3DDB
-
-__license__ = "GPLv3"
 
 
 class PhysiologicalCoordSystem:
@@ -126,8 +123,8 @@ class PhysiologicalCoordSystem:
         )
         return c_mod[0]['PhysiologicalModalityID'] if c_mod else None
 
-    def grep_coord_system(self, coord_mod_id: int, coord_name_id: int = None,
-                          coord_unit_id: int = None, coord_type_id: int = None):
+    def grep_coord_system(self, coord_mod_id: int, coord_name_id: int | None = None,
+                          coord_unit_id: int | None = None, coord_type_id: int | None = None):
         """
         Get a coordinate system by ID.
         Requires at least the modality.
@@ -227,7 +224,7 @@ class PhysiologicalCoordSystem:
 
     def insert_coord_system_electrodes_relation(self, physiological_file_id: int,
                                                 coord_system_id: int,
-                                                electrode_ids: List[int]):
+                                                electrode_ids: list[int]):
         """
         Inserts new entries in the physiological_coord_system_electrode_rel table.
         :param physiological_file_id : physiological file ID
@@ -252,12 +249,13 @@ class PhysiologicalCoordSystem:
         )
 
     def insert_coord_system_point_3d_relation(self, coord_system_id: int,
-                                              point_ids: Dict[str, int]):
+                                              point_ids: dict[str, int]):
         """
         Insert new entries in the physiological_coord_system_point_3d_rel table.
         :param coord_system_id : coordinate system ID
          :type coord_system_id : int
-        :param point_ids       : dict of (point name,point_3d id) associated with the coordinate system ID
+        :param point_ids       : dict of (point name,point_3d id) associated with the coordinate
+                                 system ID
          :type point_ids       : Dict[str, int]
         """
         values_to_insert = []
