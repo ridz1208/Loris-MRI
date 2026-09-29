@@ -71,35 +71,52 @@ def insert_image(
     # refuses to overwrite a different file that is already at the destination.
     copy_file(image.path, file_path, env.verbose)
 
-    # register_imaging_file sets the user, the insert time, the coordinate and
-    # output spaces, and SourceFileID. The last one matters: it is a foreign key
-    # onto files.FileID with a default of 0, so a row that omits it inserts 0 and
-    # the constraint rejects it.
-    file = register_imaging_file(
-        env,
-        PNG_FILE_TYPE,
-        file_rel_path,
-        session,
-        mri_scan_type,
-        echo_time                = None,
-        echo_number              = None,
-        phase_encoding_direction = None,
-    )
+    # Everything from here writes to the database. If any of it fails, the copy
+    # above is an orphan: a file in the assembly tree that no files row points
+    # at, which nothing will ever clean up and which will collide with the next
+    # run's version counter. So the copy is removed before the error is raised.
+    try:
+        # register_imaging_file sets the user, the insert time, the coordinate
+        # and output spaces, and SourceFileID. The last one matters: it is a
+        # foreign key onto files.FileID with a default of 0, so a row that omits
+        # it inserts 0 and the constraint rejects it.
+        file = register_imaging_file(
+            env,
+            PNG_FILE_TYPE,
+            file_rel_path,
+            session,
+            mri_scan_type,
+            echo_time                = None,
+            echo_number              = None,
+            phase_encoding_direction = None,
+        )
 
-    # A PNG carries no header and no JSON sidecar, so sessions.tsv is the only
-    # place an acquisition date can come from. register_imaging_file does not
-    # take one, since a DICOM or NIfTI brings its own.
-    if image.acq_date is not None:
-        file.acquisition_date = datetime.date.fromisoformat(image.acq_date)
+        # A PNG carries no header and no JSON sidecar, so sessions.tsv is the
+        # only place an acquisition date can come from. register_imaging_file
+        # does not take one, since a DICOM or NIfTI brings its own.
+        if image.acq_date is not None:
+            file.acquisition_date = datetime.date.fromisoformat(image.acq_date)
+
+        # source_filename preserves the name the submitter gave the image, which
+        # the rename to the assembly convention would otherwise lose.
+        register_file_parameters(env, file, {
+            'md5hash':           image.md5_hash,
+            'file_blake2b_hash': blake2b_hash,
+            'source_filename':   os.path.basename(image.path),
+        })
+
         env.db.commit()
+    except Exception as exception:
+        env.db.rollback()
 
-    # source_filename preserves the name the submitter gave the image, which the
-    # rename to the assembly convention would otherwise lose.
-    register_file_parameters(env, file, {
-        'md5hash':           image.md5_hash,
-        'file_blake2b_hash': blake2b_hash,
-        'source_filename':   os.path.basename(image.path),
-    })
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        log_error_exit(
+            env,
+            f"Could not register {image.location}: {exception}",
+            lib.exitcode.INSERT_FAILURE,
+        )
 
     log(env, f"{image.location} inserted as FileID {file.id} ({file_rel_path})")
 
