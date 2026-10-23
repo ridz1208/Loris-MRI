@@ -81,7 +81,6 @@ my $tarTypeVersion = 1;
 my ($dcm_source, $targetlocation);
 my $verbose    = 0;
 my $profile    = undef;
-my $neurodbCenterName = undef;
 my $clobber    = 0;
 my $dbase      = 0;
 my $todayDate  = 0;
@@ -124,9 +123,7 @@ my @arg_table =
      ["-clobber", "boolean", 1,   \$clobber, "Use this option only if you want
      to replace the resulting tarball!"],
      ["-profile","string",1, \$profile, "Specify the name of the config file
-     which resides in .loris_mri in the current directory."],
-     ["-centerName","string",1, \$neurodbCenterName, "Specify the symbolic
-     center name to be stored alongside the DICOM institution."],
+     which resides in the config directory."],
      ["General options", "section"],
      ["-verbose", "boolean", 1,   \$verbose, "Be verbose."],
      ["-version", "boolean", 1,   \$version, "Print cvs version number and
@@ -309,9 +306,8 @@ if ($dbase) {
     my $ArchiveLocation = $finalTarget;
     $ArchiveLocation    =~ s/$targetlocation\/?//g;
     ($success, $error)    = $summary->database($dbh, $metaname, $update,
-                            $tarTypeVersion, $tarinfo, $DICOMmd5sum,
-                            $ARCHIVEmd5sum, $ArchiveLocation,
-                            $neurodbCenterName);
+                            $tarinfo, $DICOMmd5sum,
+                            $ARCHIVEmd5sum, $ArchiveLocation);
 }
 
 # delete tmp files

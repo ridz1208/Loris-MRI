@@ -18,6 +18,10 @@
 - changed-files:
   - any-glob-to-any-file: 'python/loris_dicom_importer/**'
 
+"Package: DICOM to BIDS converter":
+- changed-files:
+  - any-glob-to-any-file: 'python/loris_dicom_to_bids_converter/**'
+
 "Package: Electrophysiology chunker":
 - changed-files:
   - any-glob-to-any-file: 'python/loris_ephys_chunker/**'

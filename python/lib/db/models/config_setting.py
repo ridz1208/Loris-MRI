@@ -16,3 +16,8 @@ class DbConfigSetting(Base):
     parent_id      : Mapped[int | None]  = mapped_column('Parent')
     label          : Mapped[str | None]  = mapped_column('Label')
     order_number   : Mapped[int | None]  = mapped_column('OrderNumber')
+
+    # C-BIG OVERRIDE START
+    # Restore ConfigCategories, CategoryID, its relationship, and Multilingual when
+    # C-BIG updates to LORIS 30. The current C-BIG schema does not support them.
+    # C-BIG OVERRIDE END

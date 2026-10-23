@@ -1785,9 +1785,9 @@ sub moveAndUpdateTarchive {
     $query = "UPDATE tarchive ".
              " SET ArchiveLocation=" . 
               ${$this->{'dbhr'}}->quote($newArchiveLocationField) .
-             " WHERE DicomArchiveID=". 
+             " WHERE StudyInstanceUID=".
              ${$this->{'dbhr'}}->quote(
-                $tarchiveInfo->{'DicomArchiveID'}
+                $tarchiveInfo->{'StudyInstanceUID'}
              );
     print $query . "\n"  if $this->{debug};
     ${$this->{'dbhr'}}->do($query);

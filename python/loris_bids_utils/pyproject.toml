@@ -1,6 +1,6 @@
 [project]
 name = "loris-bids-utils"
-version = "27.0.0"
+version = "29.0.0"
 description = "The LORIS BIDS utilities library"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -9,6 +9,10 @@ dependencies = [
     "loris-utils",
     "pybids",
 ]
+
+[project.scripts]
+copy-bids-ctf-ds = "loris_bids_utils.scripts.copy_bids_ctf_ds:main"
+copy-ctf-ds      = "loris_bids_utils.scripts.copy_ctf_ds:main"
 
 [build-system]
 requires = ["hatchling"]

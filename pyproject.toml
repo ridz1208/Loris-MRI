@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "loris"
-version = "27.0.0"
+version = "29.0.0"
 description = "The LORIS Python package"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -24,17 +24,28 @@ dependencies = [
     "scipy",
     "sqlalchemy>=2.0.0",
     "typing-extensions",
-    "loris-bids-importer  @ {root:uri}/python/loris_bids_importer",
-    "loris-bids-utils     @ {root:uri}/python/loris_bids_utils",
-    "loris-dicom-importer @ {root:uri}/python/loris_dicom_importer",
-    "loris-ephys-chunker  @ {root:uri}/python/loris_ephys_chunker",
-    "loris-utils          @ {root:uri}/python/loris_utils",
+    "loris-bids-importer           @ {root:uri}/python/loris_bids_importer",
+    "loris-bids-utils              @ {root:uri}/python/loris_bids_utils",
+    "loris-dicom-importer          @ {root:uri}/python/loris_dicom_importer",
+    "loris-dicom-to-bids-converter @ {root:uri}/python/loris_dicom_to_bids_converter",
+    "loris-ephys-chunker           @ {root:uri}/python/loris_ephys_chunker",
+    "loris-utils                   @ {root:uri}/python/loris_utils",
 ]
 
 [project.optional-dependencies]
+all = [
+    "loris-ephys-visualizer-module @ {root:uri}/python/loris_ephys_visualizer_module",
+    "loris-meegqc-module           @ {root:uri}/python/loris_meegqc_module",
+    "loris-server                  @ {root:uri}/python/loris_server",
+]
+
+test = [
+    "pytest",
+]
+
+# Dependencies used to run the static tests.
 dev = [
     "pyright",
-    "pytest",
     "ruff",
     "typos",
 ]
@@ -55,11 +66,15 @@ packages = [
 members = ["python/loris_*"]
 
 [tool.uv.sources]
-loris_bids_importer  = { workspace = true }
-loris_bids_utils     = { workspace = true }
-loris_dicom_importer = { workspace = true }
-loris_ephys_chunker  = { workspace = true }
-loris_utils          = { workspace = true }
+loris_bids_importer           = { workspace = true }
+loris_bids_utils              = { workspace = true }
+loris_dicom_importer          = { workspace = true }
+loris_dicom_to_bids_converter = { workspace = true }
+loris_ephys_chunker           = { workspace = true }
+loris_ephys_visualizer_module = { workspace = true }
+loris_meegqc_module           = { workspace = true }
+loris_server                  = { workspace = true }
+loris_utils                   = { workspace = true }
 
 [tool.ruff]
 src = ["python"]
@@ -68,8 +83,8 @@ line-length = 120
 preview = true
 
 [tool.ruff.lint]
-ignore = ["E202", "E203", "E221", "E241", "E251", "E272"]
-select = ["E", "EXE", "F", "I", "N", "RUF", "UP", "W"]
+ignore = ["E202", "E203", "E221", "E241", "E251", "E272", "FAST003"]
+select = ["E", "EXE", "F", "FAST", "I", "N", "RUF", "UP", "W"]
 
 [tool.ruff.lint.pycodestyle]
 max-doc-length = 100
@@ -77,6 +92,9 @@ max-doc-length = 100
 [tool.ruff.lint.per-file-ignores]
 # ORM models often have very long lines.
 "python/lib/db/models/*.py" = ["E501"]
+# ORM queries can use booleans and `None` in comparisons.
+"python/lib/db/queries/*.py" = ["E711", "E712"]
+"python/loris_meegqc_module/src/loris_meegqc_module/database/models/*.py" = ["E501"]
 
 # The strict type checking configuration is used to type check only the modern (typed) modules. An
 # additional basic type checking configuration to type check legacy modules can be found in the
@@ -108,13 +126,9 @@ exclude = [
     "python/scripts/extract_eeg_bids_archive.py",
     "python/scripts/ingest_eeg_bids_datasets.py",
     # DICOM to BIDS converter pipeline
-    "python/lib/dcm2bids_imaging_pipeline_lib",
-    "python/scripts/run_dicom_archive_loader.py",
-    "python/scripts/run_dicom_archive_validation.py",
-    "python/scripts/run_nifti_insertion.py",
-    "python/scripts/run_push_imaging_files_to_s3_pipeline.py",
+    "python/loris_dicom_to_bids_converter",
     # Untyped EEG BIDS import code
-    "python/loris_bids_importer/src/loris_bids_importer/eeg",
+    "python/loris_bids_importer/src/loris_bids_importer/eeg/main.py",
     # Generated protocol buffer code
     "python/loris_ephys_chunker/src/loris_ephys_chunker/protocol_buffers",
 ]
@@ -126,6 +140,8 @@ reportMissingTypeStubs = "none"
 extend-exclude = [
     "*.al", "*.pl", "*.pm",
     "/docs/scripts_md",
+    "/python/loris_bids_utils/tests/meg/ctf",
+    "/test/loris-data.env",
 ]
 
 [tool.typos.default]
@@ -133,13 +149,20 @@ locale = "en-us"
 
 [tool.typos.default.extend-words]
 Centre = "Centre"  # McGill Centre for Integrative Neuroscience
+Colour = "Colour"  # SQL column name in sex table
 HED = "HED"  # Hierarchical Event Descriptors
 ND = "ND"  # Image Type DICOM attribute
 
 [tool.typos.default.extend-identifiers]
 ba = "ba"  # A CLI option of dcm2niix
+CapTrak = "CapTrak"  # BrainVision CapTrak
+PN900 = "PN900"  # MEG CTF documentation part number prefix
 
 [tool.pytest.ini_options]
 # Integration tests are located in `python/tests/integration`, but they should be ran from the
 # appropriate Docker image (usually using GitHub Actions).
-testpaths = ["python/tests/unit"]
+addopts = ["--import-mode=importlib"]
+testpaths = [
+    "python/tests/unit",
+    "python/loris_*/tests",
+]

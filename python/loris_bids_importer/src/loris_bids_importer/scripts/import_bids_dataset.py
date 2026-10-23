@@ -7,12 +7,12 @@ import lib.exitcode
 from lib.logging import log_error_exit
 from lib.lorisgetopt import LorisGetOpt
 
-from loris_bids_importer.args import Args
+from loris_bids_importer.importer import BidsImporterArgs
 from loris_bids_importer.main import import_bids_dataset
 
 
-def pack_args(options_dict: dict[str, Any]) -> Args:
-    return Args(
+def pack_args(options_dict: dict[str, Any]) -> BidsImporterArgs:
+    return BidsImporterArgs(
         source_bids_path = Path(options_dict['directory']['value']),
         type             = options_dict['type']['value'],
         bids_validation  = not options_dict['no-bids-validation']['value'],
@@ -90,12 +90,7 @@ def main():
 
     args = pack_args(loris_getopt_obj.options_dict)
 
-    # read and insert BIDS data
-    import_bids_dataset(
-        env,
-        args,
-        loris_getopt_obj.db,
-    )
+    import_bids_dataset(env, args)
 
     print("Success !")
 

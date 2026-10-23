@@ -1,4 +1,4 @@
-from datetime import datetime, time
+from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import ForeignKey
@@ -18,18 +18,13 @@ class DbPhysioTaskEvent(Base):
     insert_time    : Mapped[datetime]       = mapped_column('InsertTime', default=datetime.now)
     onset          : Mapped[Decimal]        = mapped_column('Onset')
     duration       : Mapped[Decimal]        = mapped_column('Duration')
+    channel        : Mapped[str | None]     = mapped_column('Channel')
     event_code     : Mapped[int | None]     = mapped_column('EventCode')
     event_value    : Mapped[str | None]     = mapped_column('EventValue')
-    # C-BIG OVERRIDE START
-    # Remove when updating to LORIS 29
-    event_sample   : Mapped[Decimal | None] = mapped_column('EventSample')
-    # C-BIG OVERRIDE END
+    event_sample   : Mapped[int | None]     = mapped_column('EventSample')
     event_type     : Mapped[str | None]     = mapped_column('EventType')
     trial_type     : Mapped[str | None]     = mapped_column('TrialType')
-    # C-BIG OVERRIDE START
-    # Remove when updating to LORIS 29
-    response_time  : Mapped[time | None] = mapped_column('ResponseTime')
-    # C-BIG OVERRIDE END
+    response_time  : Mapped[Decimal | None] = mapped_column('ResponseTime')
 
     physio_file : Mapped['db_physio_file.DbPhysioFile']            = relationship('DbPhysioFile')
     event_file  : Mapped['db_physio_event_file.DbPhysioEventFile'] = relationship('DbPhysioEventFile', back_populates='task_events')

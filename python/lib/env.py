@@ -1,3 +1,4 @@
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,10 +40,27 @@ class Env:
     script_name: str
     config_info: Any
     tmp_dir_path: Path
-    log_file_path: Path
+    log_file_path: Path | None
     verbose: bool
     cleanups: list[Callable[[], None]]
     notifier: Notifier | None = None
+
+    def close(self):
+        """
+        Close the environment resources and remove its temporary directory. It is not required to
+        manually call this method in processes that only have a single long-lived environment. But
+        it is advised to do so in processes that manage multiple short-lived environments.
+        """
+
+        try:
+            if self.notifier is not None:
+                self.notifier.db.close()
+        finally:
+            try:
+                self.db.close()
+            finally:
+                self.db_engine.dispose()
+                shutil.rmtree(self.tmp_dir_path, ignore_errors=True)
 
     def add_cleanup(self, cleanup: Callable[[], None]):
         """

@@ -5,6 +5,7 @@ from typing import Any
 
 from lib.db.models.bids_event_dataset_mapping import DbBidsEventDatasetMapping
 from lib.db.models.bids_event_file_mapping import DbBidsEventFileMapping
+from lib.db.models.bids_file import DbBidsFile
 from lib.db.models.physio_event_file import DbPhysioEventFile
 from lib.db.models.physio_file import DbPhysioFile
 from lib.db.models.physio_task_event import DbPhysioTaskEvent
@@ -49,7 +50,12 @@ class EventDictFileSource:
         )
 
 
-def insert_event_dict_file(env: Env, source: EventDictFileSource, event_file_path: Path) -> DbPhysioEventFile:
+def insert_event_dict_file(
+    env: Env,
+    bids_info: DbBidsFile,
+    source: EventDictFileSource,
+    event_file_path: Path,
+) -> DbPhysioEventFile:
     """
     Insert an event dictionary file into the LORIS database.
     """
@@ -59,6 +65,7 @@ def insert_event_dict_file(env: Env, source: EventDictFileSource, event_file_pat
         project_id     = source.project.id,
         file_type      = 'json',
         file_path      = event_file_path,
+        bids_info_id   = bids_info.id,
     )
 
     env.db.add(event_dict_file)
@@ -204,7 +211,12 @@ def parse_and_insert_event_dict(
     return tag_dict
 
 
-def insert_events_file(env: Env, physio_file: DbPhysioFile, event_file_path: Path) -> DbPhysioEventFile:
+def insert_events_file(
+    env: Env,
+    physio_file: DbPhysioFile,
+    bids_info: DbBidsFile,
+    event_file_path: Path,
+) -> DbPhysioEventFile:
     """
     Insert an events file into the LORIS database.
     """
@@ -214,6 +226,7 @@ def insert_events_file(env: Env, physio_file: DbPhysioFile, event_file_path: Pat
         project_id     = physio_file.session.project.id,
         file_type      = 'tsv',
         file_path      = event_file_path,
+        bids_info_id   = bids_info.id,
     )
 
     env.db.add(event_dict_file)
@@ -245,18 +258,10 @@ def insert_physio_task_event(
         duration       = duration,
         event_code     = event_code,
         event_value    = event_value,
-        # C-BIG OVERRIDE START
-        # Remove when updating to LORIS 29
-        event_sample   = Decimal(event_sample) if event_sample is not None else None,
-        # C-BIG OVERRIDE END
+        event_sample   = event_sample,
         event_type     = event_type,
         trial_type     = trial_type,
-        # C-BIG OVERRIDE START
-        # Remove when updating to LORIS 29
-        # Note that the field is (incorrectly) a `time` object before LORIS 29, but SQLAlchemy
-        # should accept integers.
-        response_time  = int(response_time) if response_time is not None else None,
-        # C-BIG OVERRIDE END
+        response_time  = response_time,
     )
 
     env.db.add(event_task_file)

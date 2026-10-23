@@ -2,7 +2,6 @@ import json
 import math
 import sys
 from collections import OrderedDict
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -48,27 +47,50 @@ def create_chunks_from_values_lists(values_lists: list[ChannelArray], chunk_size
 def downsample_channel(channel: ChannelArray, chunk_size: int, downsampling: int) -> ChannelArray:
     if downsampling == 0:
         return channel
-    down = chunk_size**downsampling
-    downsampled_size = channel.shape[-1] / down
-    if downsampled_size <= chunk_size * 2:
-        downsampled_size = chunk_size * 2
-    return signal.resample(channel, downsampled_size, axis=-1)  # type: ignore
+
+    sample_count = channel.shape[-1]
+    requested_factor = chunk_size**downsampling
+    target_size = max(math.ceil(sample_count / requested_factor), chunk_size * 2)
+
+    # Keep the FIR filter reasonably sized even when the input and target lengths are relatively
+    # prime. Rounding down guarantees at least target_size output samples; chunk padding handles
+    # the small excess.
+    effective_factor = max(1, sample_count // target_size)
+    if effective_factor == 1:
+        return channel
+
+    # FFT resampling treats the recording as periodic and rings where the final and first samples
+    # are implicitly joined. Polyphase FIR resampling avoids that wraparound, while linear boundary
+    # extension prevents zero/constant padding from introducing a new endpoint discontinuity.
+    return signal.resample_poly(  # type: ignore
+        channel,
+        up=1,
+        down=effective_factor,
+        axis=-1,
+        padtype='line',
+    )
 
 
-def create_downsampled_values_lists(channel: ChannelArray, chunk_size: int) -> list[ChannelArray]:
-    downsamplings = math.ceil(math.log(channel.shape[-1]) / math.log(chunk_size))
-    downsamplings = range(downsamplings - 1, -1, -1)
-    downsampled_channels = [
-        downsample_channel(channel, chunk_size, downsampling)
-        for downsampling in downsamplings
-    ]
+def create_downsampled_values_lists(
+    channel: ChannelArray,
+    chunk_size: int,
+    downsamplings: int | None = None,
+) -> list[ChannelArray]:
+    if downsamplings is not None and downsamplings <= 0:
+        return []
+
+    downsampling_count = math.ceil(math.log(channel.shape[-1]) / math.log(chunk_size))
+    downsampling_levels = range(downsampling_count - 1, -1, -1)
     sizes: set[int] = set()
     unique_sized: list[ChannelArray] = []
-    for channel in downsampled_channels:
-        if channel.shape[-1] in sizes:
+    for downsampling_level in downsampling_levels:
+        downsampled_channel = downsample_channel(channel, chunk_size, downsampling_level)
+        if downsampled_channel.shape[-1] in sizes:
             continue
-        unique_sized.append(channel)
-        sizes.add(channel.shape[-1])
+        unique_sized.append(downsampled_channel)
+        sizes.add(downsampled_channel.shape[-1])
+        if downsamplings is not None and len(unique_sized) >= downsamplings:
+            break
     return unique_sized
 
 
@@ -101,12 +123,14 @@ def write_index_json(
             if downsamplings != data['downsamplings']:
                 sys.exit("Downsamplings does not match the one found in index.json.")
 
-            indices = [channelMetadata['index'] for channelMetadata in channel_metadata]
+            indices = [channel_metadata_entry['index'] for channel_metadata_entry in channel_metadata]
             channel_metadata.extend(
-                channelMetadata for channelMetadata in data['channelMetadata']
-                if channelMetadata['index'] not in indices
+                channel_metadata_entry for channel_metadata_entry in data['channelMetadata']
+                if channel_metadata_entry['index'] not in indices
             )
             channel_metadata = sorted(channel_metadata, key=lambda k: k['index'])
+            for shape in shapes:
+                shape[0] = len(channel_metadata)
             if data['seriesRange'][0] < series_range[0]:
                 series_range = (data['seriesRange'][0], series_range[1])
 
@@ -150,105 +174,133 @@ def write_chunks(chunk_dir: Path, channel_chunks_list: list[ChannelArray], chann
                     / str(trace_index)
                 )
 
-                trace_path.mkdir(parents=True)
+                trace_path.mkdir(parents=True, exist_ok=True)
                 for chunk_index, chunk in enumerate(trace):
                     encoded_chunk = encode_chunk(chunk, chunk_index, downsampling)
                     with open(trace_path / f'{chunk_index}.buf', 'w+b') as chunk_file:
                         chunk_file.write(encoded_chunk)
 
 
-def mne_file_to_chunks(
-    path: Path,
+def write_mne_channels(
+    chunk_dir: Path,
     chunk_size: int,
-    loader: Callable[[Path], BaseRaw],
+    raw: BaseRaw,
+    from_channel_index: int,
     from_channel_name: str | None,
     channel_count: int | None,
+    downsamplings: int | None,
+    channel_indices: list[int] | None,
 ) -> tuple[
-    list[ChannelArray],
     tuple[np.float64, np.float64],
     tuple[float, float],
     list[str],
+    list[int],
     list[tuple[float, float]],
     list[int],
+    list[list[int]],
 ]:
-    parsed = loader(path)
-    time_interval: tuple[np.float64, np.float64] = (parsed.times[0], parsed.times[-1])
-    channel_names = cast(list[str], parsed.info["ch_names"])
+    """Read and write selected channels while retaining only one channel's data in memory."""
+    time_interval: tuple[np.float64, np.float64] = (raw.times[0], raw.times[-1])
+    channel_names = cast(list[str], raw.info["ch_names"])
     channel_ranges: list[tuple[float, float]] = []
     signal_range = (np.inf, -np.inf)
-    channel_chunks_list = []
-    selected_channels = []
-    valid_samples_in_last_chunk = []
+    valid_samples_in_last_chunk: list[int] = []
+    shapes: list[list[int]] = []
 
-    if from_channel_name:
+    if channel_indices is not None:
+        selected_channel_indices = channel_indices
+    elif from_channel_name is not None:
         from_channel_index = channel_names.index(from_channel_name)
-        if channel_count and from_channel_index + channel_count < len(channel_names):
-            selected_channels = channel_names[from_channel_index:from_channel_index + channel_count]
+        if channel_count is not None:
+            selected_channel_indices = list(range(
+                from_channel_index,
+                min(from_channel_index + channel_count, len(channel_names)),
+            ))
         else:
-            selected_channels = channel_names[from_channel_index:]
+            selected_channel_indices = list(range(from_channel_index, len(channel_names)))
+    else:
+        selected_channel_indices = list(range(len(channel_names)))
+    selected_channels = [channel_names[index] for index in selected_channel_indices]
 
-    for i, channel_name in enumerate(selected_channels, start=1):
+    for i, (channel_index, channel_name) in enumerate(
+        zip(selected_channel_indices, selected_channels, strict=True),
+        start=1,
+    ):
         print(f"Processing channel {channel_name} ({i} / {len(selected_channels)})")
-        channel = cast(ChannelArray, parsed.get_data(channel_name))  # type: ignore
+        channel = cast(ChannelArray, raw.get_data(channel_name))  # type: ignore
         channel_min = np.amin(channel)
         channel_max = np.amax(channel)
         channel_ranges.append((channel_min, channel_max))
         signal_range = (min(channel_min, signal_range[0]), max(channel_max, signal_range[1]))
 
         channel = np.expand_dims(channel, axis=-2)
-        downsampled_values_lists = create_downsampled_values_lists(channel, chunk_size)
+        downsampled_values_lists = create_downsampled_values_lists(channel, chunk_size, downsamplings)
         chunks = create_chunks_from_values_lists(downsampled_values_lists, chunk_size)
 
-        if not channel_chunks_list:
-            channel_chunks_list = chunks
+        if not shapes:
+            shapes = [
+                [len(selected_channels), *downsampled_chunks.shape[1:]]
+                for downsampled_chunks in chunks
+            ]
             # Assuming all channels have the same recording length as first channel
             valid_samples_in_last_chunk = [
                 num_values % chunk_size or chunk_size   # chunk size if 0
                 for num_values in map(lambda values: len(values[0][0]), downsampled_values_lists)
             ]
-        else:
-            for j, chunk in enumerate(chunks):
-                channel_chunks_list[j] = np.append(channel_chunks_list[j], chunk, axis=0)
+        write_chunks(chunk_dir, chunks, channel_index)
 
-    return channel_chunks_list, time_interval, signal_range, channel_names, channel_ranges, valid_samples_in_last_chunk
+    return (
+        time_interval,
+        signal_range,
+        selected_channels,
+        selected_channel_indices,
+        channel_ranges,
+        valid_samples_in_last_chunk,
+        shapes,
+    )
 
 
 def write_chunk_directory(
     path: Path,
+    raw: BaseRaw,
     chunk_size: int,
-    loader: Callable[[Path], BaseRaw],
     from_channel_index: int = 0,
     from_channel_name: str | None = None,
     channel_count: int | None = None,
     downsamplings: int | None = None,
     prefix: str | None = None,
     destination: Path | None = None,
+    channel_indices: list[int] | None = None,
 ):
     chunk_dir = chunk_dir_path(path, prefix=prefix, destination=destination)
-    channel_chunks_list, time_interval, signal_range, \
-        channel_names, channel_ranges, valid_samples_in_last_chunk = \
-        mne_file_to_chunks(path, chunk_size, loader, from_channel_name, channel_count)
-
-    if downsamplings is not None:
-        channel_chunks_list = channel_chunks_list[:downsamplings]
+    time_interval, signal_range, channel_names, selected_channel_indices, channel_ranges, \
+        valid_samples_in_last_chunk, shapes = write_mne_channels(
+            chunk_dir,
+            chunk_size,
+            raw,
+            from_channel_index,
+            from_channel_name,
+            channel_count,
+            downsamplings,
+            channel_indices,
+        )
 
     channel_metadata = [
         {
             'name': channel_names[i],
             'seriesRange': channel_ranges[i],
-            'index': from_channel_index + i
+            'index': selected_channel_indices[i]
         }
         for i in range(len(channel_ranges))
     ]
 
     write_index_json(
-        chunk_dir,
-        time_interval,
-        signal_range,
-        channel_metadata,
-        chunk_size,
-        valid_samples_in_last_chunk,
-        list(range(len(channel_chunks_list))),
-        [list(downsampled.shape) for downsampled in channel_chunks_list]
+        chunk_dir=chunk_dir,
+        time_interval=time_interval,
+        series_range=signal_range,
+        channel_metadata=channel_metadata,
+        chunk_size=chunk_size,
+        downsamplings=list(range(len(shapes))),
+        valid_samples_in_last_chunk=valid_samples_in_last_chunk,
+        shapes=shapes,
     )
-    write_chunks(chunk_dir, channel_chunks_list, from_channel_index)

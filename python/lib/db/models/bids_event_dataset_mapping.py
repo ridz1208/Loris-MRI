@@ -2,6 +2,7 @@ from sqlalchemy import ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 import lib.db.models.project as db_project
+import lib.db.models.user as db_user
 from lib.db.base import Base
 from lib.db.decorators.int_bool import IntBool
 
@@ -19,5 +20,7 @@ class DbBidsEventDatasetMapping(Base):
     has_pairing        : Mapped[bool | None] = mapped_column('HasPairing', IntBool, default=False)
     pair_rel_id        : Mapped[int | None]  = mapped_column('PairRelID')
     additional_members : Mapped[int | None]  = mapped_column('AdditionalMembers', default=0)
+    tagger_id          : Mapped[int | None]  = mapped_column('TaggedBy', ForeignKey('users.ID'))
 
     project : Mapped['db_project.DbProject'] = relationship('DbProject')
+    tagger  : Mapped['db_user.DbUser | None'] = relationship('DbUser')

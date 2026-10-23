@@ -97,12 +97,12 @@ $dbh = &NeuroDB::DBI::connect_to_db(@Settings::db);
 my $tarchiveID;
 my $tarchiveBasename = basename($tarchive);
 (my $query = <<QUERY) =~ s/\n/ /gm;
-SELECT 
-  TarchiveID 
-FROM 
-  tarchive 
-WHERE 
-  DicomArchiveID=?
+SELECT
+  TarchiveID
+FROM
+  tarchive
+WHERE
+  StudyInstanceUID=?
   AND ArchiveLocation like ?
 QUERY
 my $sth   = $dbh->prepare($query);

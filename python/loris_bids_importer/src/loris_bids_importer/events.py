@@ -18,18 +18,19 @@ from lib.physio.events import (
     parse_and_insert_event_dict,
 )
 from lib.physio.hed import TagGroupMember, build_hed_tag_groups, filter_inherited_tags
-from lib.physio.parameters import insert_physio_file_parameter, insert_physio_project_parameter
+from lib.physio.parameters import insert_physio_project_parameter, register_physio_file_parameter
 from loris_bids_utils.files.events import OPTIONAL_EVENT_FIELDS, BidsEventsTsvFile
 from loris_bids_utils.json import BidsJsonFile
 from loris_utils.crypto import compute_file_blake2b_hash
 
 from loris_bids_importer.copy_files import copy_loris_bids_file, get_loris_bids_root_file_path
-from loris_bids_importer.env import BidsImportEnv
+from loris_bids_importer.dataset import get_or_create_loris_bids_file
+from loris_bids_importer.importer import BidsImporter
 
 
 def import_bids_root_event_dict_file(
     env: Env,
-    import_env: BidsImportEnv,
+    importer: BidsImporter,
     project: DbProject,
     bids_event_dict_file: BidsJsonFile,
 ) -> tuple[DbPhysioEventFile, dict[str, dict[str, list[list[TagGroupMember]]]]]:
@@ -37,12 +38,13 @@ def import_bids_root_event_dict_file(
     Import a root-level BIDS event dictionary file and its associated HED tags into LORIS.
     """
 
-    loris_event_dict_file_path = get_loris_bids_root_file_path(import_env, bids_event_dict_file.path)
+    loris_event_dict_file_path = get_loris_bids_root_file_path(importer, bids_event_dict_file.path)
 
-    copy_loris_bids_file(import_env, bids_event_dict_file.path, loris_event_dict_file_path)
+    copy_loris_bids_file(importer, bids_event_dict_file.path, loris_event_dict_file_path)
 
     event_dict_file, hed_tags_dict = insert_bids_event_dict_file(
         env,
+        importer,
         EventDictFileSource.from_dataset(project),
         bids_event_dict_file,
         loris_event_dict_file_path,
@@ -55,6 +57,7 @@ def import_bids_root_event_dict_file(
 
 def insert_bids_event_dict_file(
     env: Env,
+    importer: BidsImporter,
     source: EventDictFileSource,
     bids_event_dict_file: BidsJsonFile,
     loris_event_dict_file_path: Path,
@@ -63,14 +66,15 @@ def insert_bids_event_dict_file(
     Insert a BIDS event dictionary file and its associated HED tags into the LORIS database.
     """
 
-    event_dict_file = insert_event_dict_file(env, source, loris_event_dict_file_path)
+    bids_info = get_or_create_loris_bids_file(env, importer, bids_event_dict_file.path, loris_event_dict_file_path)
+    event_dict_file = insert_event_dict_file(env, bids_info, source, loris_event_dict_file_path)
 
     blake2b_hash = compute_file_blake2b_hash(bids_event_dict_file.path)
 
     hed_tags_dict = parse_and_insert_event_dict(env, bids_event_dict_file.data, source)
 
     if source.physio_file is not None:
-        insert_physio_file_parameter(env, source.physio_file, 'event_file_json_blake2b_hash', blake2b_hash)
+        register_physio_file_parameter(env, source.physio_file, 'event_file_json_blake2b_hash', blake2b_hash)
     else:
         insert_physio_project_parameter(env, source.project.id, 'event_file_json_blake2b_hash', blake2b_hash)
 
@@ -80,6 +84,7 @@ def insert_bids_event_dict_file(
 # TODO: This function contains a lot of legacy code and needs to be refactored.
 def insert_bids_events_file(
     env: Env,
+    importer: BidsImporter,
     physio_file: DbPhysioFile,
     events_file: BidsEventsTsvFile,
     loris_events_file_path: Path,
@@ -99,10 +104,11 @@ def insert_bids_events_file(
 
     blake2_hash = compute_file_blake2b_hash(events_file.path)
 
-    event_file = insert_events_file(env, physio_file, loris_events_file_path)
+    bids_info = get_or_create_loris_bids_file(env, importer, events_file.path, loris_events_file_path)
+    event_file = insert_events_file(env, physio_file, bids_info, loris_events_file_path)
 
     # insert blake2b hash of task event file into physiological_parameter_file
-    insert_physio_file_parameter(env, physio_file, 'event_file_blake2b_hash', blake2_hash)
+    register_physio_file_parameter(env, physio_file, 'event_file_blake2b_hash', blake2_hash)
 
     event_fields = (
         'PhysiologicalFileID', 'Onset',     'Duration',   'TrialType',

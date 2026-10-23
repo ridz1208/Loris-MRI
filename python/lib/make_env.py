@@ -19,6 +19,7 @@ def make_env(
     script_options: dict[str, Any],
     config_info: Any,
     verbose: bool,
+    log_file: bool = True,
 ) -> Env:
     """
     Create a new script environment using the provided arguments.
@@ -51,10 +52,12 @@ def make_env(
 
     tmp_dir_path = create_script_tmp_dir(script_name)
 
-    log_dir_path = data_dir / 'logs' / script_name
-    log_dir_path.mkdir(exist_ok=True)
-
-    log_file_path = log_dir_path / f'{tmp_dir_path.name}.log'
+    if log_file:
+        log_dir_path  = data_dir / 'logs' / script_name
+        log_file_path = log_dir_path / f'{tmp_dir_path.name}.log'
+        log_dir_path.mkdir(exist_ok=True)
+    else:
+        log_file_path = None
 
     env = Env(
         engine,
@@ -67,16 +70,17 @@ def make_env(
         [],
     )
 
-    log_file_header = get_log_file_header(env, script_options)
-    write_to_log_file(env, log_file_header)
+    if env.log_file_path is not None:
+        log_file_header = get_log_file_header(env.log_file_path, script_options)
+        write_to_log_file(env, log_file_header)
 
     log_verbose(env, 'Successfully connected to the database')
 
     return env
 
 
-def get_log_file_header(env: Env, script_options: dict[str, Any]):
-    run_info = env.log_file_path.name[:-13]
+def get_log_file_header(log_file_path: Path, script_options: dict[str, Any]):
+    run_info = log_file_path.name[:-13]
     title = run_info.replace('_', ' ').upper()
     message = (
         "\n"

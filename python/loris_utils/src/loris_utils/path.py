@@ -36,8 +36,7 @@ def remove_path_extension(path: Path) -> Path:
     Remove the extension (including multiple extensions) of a path.
     """
 
-    parts = path.name.split('.')
-    return path.with_name(parts[0])
+    return path.with_name(remove_name_extension(path.name))
 
 
 def replace_path_extension(path: Path, extension: str) -> Path:
@@ -47,3 +46,11 @@ def replace_path_extension(path: Path, extension: str) -> Path:
 
     parts = path.name.split('.')
     return path.with_name(f'{parts[0]}.{extension}')
+
+
+def remove_name_extension(name: str) -> str:
+    """
+    Remove the extension (including multiple extensions) of a file name.
+    """
+
+    return name.split('.')[0]

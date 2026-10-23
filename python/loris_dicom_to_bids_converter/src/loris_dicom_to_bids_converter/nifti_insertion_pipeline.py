@@ -1,0 +1,711 @@
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import lib.exitcode
+from lib.db.queries.dicom_archive import try_get_dicom_archive_series_with_series_uid_echo_time
+from lib.db.queries.file import try_get_file_with_hash
+from lib.db.queries.mri_scan_type import try_get_mri_scan_type_with_id, try_get_mri_scan_type_with_name
+from lib.get_session_info import SessionConfigError, get_dicom_archive_session_info
+from lib.imaging_lib.file import register_mri_file
+from lib.imaging_lib.file_parameter import register_mri_file_parameters
+from lib.imaging_lib.nifti import add_nifti_spatial_file_parameters
+from lib.imaging_lib.nifti_pic import create_nifti_preview_picture
+from lib.logging import log_error_exit, log_verbose
+from loris_bids_importer.file_type import get_check_bids_imaging_file_type_from_extension
+from loris_bids_importer.mri.sidecar import add_bids_mri_sidecar_file_parameters, get_bids_mri_sidecar_session_info
+from loris_bids_utils.mri.sidecar import BidsMriSidecarJsonFile
+from loris_bids_utils.path import build_bids_file_name, build_bids_modality_path
+from loris_utils.crypto import compute_file_blake2b_hash, compute_file_md5_hash
+from loris_utils.path import get_path_extension
+
+from loris_dicom_to_bids_converter.base_pipeline import BasePipeline
+
+
+class NiftiInsertionPipeline(BasePipeline):
+    """
+    Pipeline that extends the BasePipeline class to add some specific NIfTI insertion processes
+    such as protocol identification and registration into the proper imaging tables.
+
+    Functions that starts with _ are functions specific to the NiftiInsertionPipeline class.
+    """
+
+    def __init__(self, loris_getopt_obj, script_name):
+        """
+        Initiate the NiftiInsertionPipeline class and runs the different steps required to insert a
+        NIfTI file with BIDS associated files into the imaging tables.
+        It will run the protocol identification and inserts the NIfTI file into the files tables if
+        the protocol was identified. Otherwise, scan will be recorded in mri_protocol_violated_scans
+        or mri_violations_log table depending on the violation.
+
+        :param loris_getopt_obj: the LorisGetOpt object with getopt values provided to the pipeline
+         :type loris_getopt_obj: LorisGetOpt obj
+        :param script_name: name of the script calling this class
+         :type script_name: str
+        """
+        super().__init__(loris_getopt_obj, script_name)
+        self.nifti_path = Path(self.options_dict["nifti_path"]["value"])
+        self.nifti_s3_url = self.options_dict["nifti_path"]["s3_url"] \
+            if 's3_url' in self.options_dict["nifti_path"].keys() else None
+        self.nifti_blake2 = compute_file_blake2b_hash(self.nifti_path)
+        self.nifti_md5 = compute_file_md5_hash(self.nifti_path)
+        self.sidecar_json = self._load_json_sidecar_file()
+        if self.sidecar_json is not None:
+            self.json_blake2 = compute_file_blake2b_hash(self.sidecar_json.path)
+            self.json_md5 = compute_file_md5_hash(self.sidecar_json.path)
+        else:
+            self.json_blake2 = None
+            self.json_md5 = None
+        self.bval_path = self.options_dict["bval_path"]["value"]
+        self.bval_blake2 = compute_file_blake2b_hash(self.bval_path) if self.bval_path else None
+        self.bvec_path = self.options_dict["bvec_path"]["value"]
+        self.bvec_blake2 = compute_file_blake2b_hash(self.bvec_path) if self.bval_path else None
+        self.loris_scan_type = self.options_dict["loris_scan_type"]["value"]
+        self.bypass_extra_checks = self.options_dict["bypass_extra_checks"]["value"]
+        self.create_pic_bool = self.options_dict["create_pic"]["value"]
+
+        # ------------------------------------------------------------------------------------------
+        # Set 'Inserting' flag to 1 in mri_upload
+        # ------------------------------------------------------------------------------------------
+        self.mri_upload.inserting = True
+        self.env.db.commit()
+
+        # ------------------------------------------------------------------------------------------
+        # Get S3 object from loris_getopt object
+        # ------------------------------------------------------------------------------------------
+        self.s3_obj = self.loris_getopt_obj.s3_obj
+
+        # ------------------------------------------------------------------------------------------
+        # Check the mri_upload table to see if the DICOM archive has been validated
+        # ------------------------------------------------------------------------------------------
+        self.check_if_tarchive_validated_in_db()
+
+        # ------------------------------------------------------------------------------------------
+        # Load the JSON file object with scan parameters if a JSON file was provided
+        # ------------------------------------------------------------------------------------------
+        self.json_file_dict = dict()
+        if self.sidecar_json is not None:
+            add_bids_mri_sidecar_file_parameters(self.env, self.sidecar_json, self.json_file_dict)
+
+        add_nifti_spatial_file_parameters(self.nifti_path, self.json_file_dict)
+
+        # ---------------------------------------------------------------------------------
+        # Determine subject IDs based on DICOM headers and validate the IDs against the DB
+        # Verify PSC information stored in DICOMs
+        # Grep scanner information based on what is in the DICOM headers
+        # ---------------------------------------------------------------------------------
+        self.init_session_info()
+
+        # ------------------------------------------------------------------------------------------
+        # Verify if the image/NIfTI file was not already registered into the database
+        # ------------------------------------------------------------------------------------------
+        self._check_if_nifti_file_was_already_inserted()
+
+        # ------------------------------------------------------------------------------------------
+        # Determine acquisition protocol (or register into mri_protocol_violated_scans and exits)
+        # ------------------------------------------------------------------------------------------
+        scan_type_id, self.mri_protocol_group_id = self._determine_acquisition_protocol()
+        self.scan_type = try_get_mri_scan_type_with_id(self.env.db, scan_type_id)
+        if not self.loris_scan_type:
+            if self.scan_type is None:
+                self._move_to_trashbin()
+                self._register_protocol_violated_scan()
+                if self.nifti_s3_url:  # push violations to S3 if provided file was on S3
+                    self._run_push_to_s3_pipeline()
+                log_error_exit(
+                    self.env,
+                    f"{self.nifti_path}'s acquisition protocol is 'unknown'.",
+                    lib.exitcode.UNKNOWN_PROTOCOL,
+                )
+        else:
+            self.scan_type = try_get_mri_scan_type_with_name(self.env.db, self.loris_scan_type)
+            if self.scan_type is None:
+                self._move_to_trashbin()
+                self._register_protocol_violated_scan()
+                if self.nifti_s3_url:  # push violations to S3 if provided file was on S3
+                    self._run_push_to_s3_pipeline()
+                log_error_exit(
+                    self.env,
+                    (
+                        f"{self.nifti_path}'s scan type {self.loris_scan_type} provided to insert-nifti"
+                        f" is not a valid scan type in the database."
+                    ),
+                    lib.exitcode.UNKNOWN_PROTOCOL,
+                )
+
+        # ------------------------------------------------------------------------------------------
+        # Determine BIDS scan type info based on scan_type_id
+        # ------------------------------------------------------------------------------------------
+        self.bids_categories_dict = self.imaging_obj.get_bids_categories_mapping_for_scan_type_id(self.scan_type.id)
+        if not self.bids_categories_dict:
+            self._move_to_trashbin()
+            self._register_protocol_violated_scan()
+            if self.nifti_s3_url:  # push violations to S3 if provided file was on S3
+                self._run_push_to_s3_pipeline()
+            log_error_exit(
+                self.env,
+                f"Scan type {self.scan_type.name} does not have BIDS tables set up.",
+                lib.exitcode.UNKNOWN_PROTOCOL,
+            )
+
+        # ------------------------------------------------------------------------------------------
+        # Run extra file checks to determine possible protocol violations
+        # ------------------------------------------------------------------------------------------
+        self.warning_violations_list = []
+        self.exclude_violations_list = []
+        if not self.bypass_extra_checks:
+            self.violations_summary = self.imaging_obj.run_extra_file_checks(
+                self.session.project_id,
+                self.session.cohort_id,
+                self.session.visit_label,
+                self.scan_type.id,
+                self.json_file_dict
+            )
+            self.warning_violations_list = self.violations_summary['warning']
+            self.exclude_violations_list = self.violations_summary['exclude']
+
+        # ------------------------------------------------------------------------------------------
+        # Register files in the proper tables
+        # ------------------------------------------------------------------------------------------
+        if self.exclude_violations_list:
+            self._move_to_trashbin()
+            self._register_violations_log(self.exclude_violations_list, self.trashbin_nifti_rel_path)
+            self._register_violations_log(self.warning_violations_list, self.trashbin_nifti_rel_path)
+            if self.nifti_s3_url:  # push violations to S3 if provided file was on S3
+                self._run_push_to_s3_pipeline()
+            log_error_exit(
+                self.env,
+                (
+                    f"{self.nifti_path} violates exclusionary checks listed in mri_protocol_checks."
+                    f" List of violations are: {self.exclude_violations_list}"
+                ),
+                lib.exitcode.UNKNOWN_PROTOCOL,
+            )
+        else:
+            self._move_to_assembly_and_insert_file_info()
+
+        # ------------------------------------------------------------------------------------------
+        # Create the pic images
+        # ------------------------------------------------------------------------------------------
+        if self.create_pic_bool:
+            create_nifti_preview_picture(self.env, self.file)
+
+        # ------------------------------------------------------------------------------------------
+        # Remove the tmp directory from the file system
+        # ------------------------------------------------------------------------------------------
+        self.remove_tmp_dir()
+
+        # ------------------------------------------------------------------------------------------
+        # Push inserted images to S3 if they were downloaded from S3
+        # ------------------------------------------------------------------------------------------
+        if self.nifti_s3_url:
+            self._run_push_to_s3_pipeline()
+
+        # ------------------------------------------------------------------------------------------
+        # If we get there, the insertion was complete and successful
+        # ------------------------------------------------------------------------------------------
+        self.mri_upload.inserting = False
+        self.env.db.commit()
+
+        sys.exit(lib.exitcode.SUCCESS)
+
+    def init_session_info(self):
+        """
+        Get the session information and assign `self.session` and `self.scanner` for this pipeline.
+        """
+
+        try:
+            if self.dicom_archive is not None:
+                self._validate_nifti_patient_name_with_dicom_patient_name()
+                session_info = get_dicom_archive_session_info(self.env, self.dicom_archive)
+            else:
+                session_info = get_bids_mri_sidecar_session_info(self.env, self.sidecar_json)
+
+                log_verbose(self.env, "Determined subject IDs based on the patient identifier stored in JSON file")
+
+            self.session     = session_info.session
+            self.mri_scanner = session_info.scanner
+
+            # Update the MRI upload.
+            self.mri_upload.is_candidate_info_validated = True
+            self.env.db.commit()
+
+            log_verbose(self.env, (
+                f"Found Center Name: {self.session.site.name},"
+                f" Center ID: {self.session.site.id}"
+            ))
+
+            log_verbose(self.env, f"Found scanner ID: {self.mri_scanner.id}")
+        except SessionConfigError as error:
+            self.imaging_obj.insert_mri_candidate_errors(
+                self.dicom_archive.patient_name,
+                self.dicom_archive.id,
+                self.json_file_dict,
+                str(self.nifti_path),
+                str(error),
+            )
+
+            if self.nifti_s3_url:  # push candidate errors to S3 if provided file was on S3
+                self._run_push_to_s3_pipeline()
+
+            log_error_exit(self.env, str(error), lib.exitcode.CANDIDATE_MISMATCH)
+
+    def _load_json_sidecar_file(self):
+        """
+        Loads the JSON file content into a dictionary.
+
+        Note: if no JSON file was provided to the pipeline, the function will return an empty
+        dictionary so that information to be stored in <parameter_file> will be added to the JSON
+        dictionary later on.
+
+        :return: dictionary with the information present in the JSON file
+         :rtype: dict
+        """
+        sidecar_json_path = Path(self.options_dict["json_path"]["value"])
+
+        if not sidecar_json_path:
+            return None
+
+        return BidsMriSidecarJsonFile(sidecar_json_path)
+
+    def _validate_nifti_patient_name_with_dicom_patient_name(self):
+        """
+        This function will validate that the PatientName present in the JSON side car file is the
+        same as the one present in the <tarchive> table.
+
+        Note: if no JSON file was provided to the script or if no "PatientName" was provided in the
+        JSON file, the scripts will rely solely on the PatientName present in the <tarchive> table.
+        """
+        if "PatientName" not in self.json_file_dict:
+            log_verbose(self.env, (
+                "PatientName not present in the JSON file or no JSON file provided along with"
+                "the NIfTI file. Will rely on the PatientName stored in the DICOM files"
+            ))
+
+            return
+
+        nifti_pname = self.json_file_dict["PatientName"]
+        if self.dicom_archive.patient_name != nifti_pname:
+            err_msg = "PatientName in DICOM and NIfTI files differ."
+            self.imaging_obj.insert_mri_candidate_errors(
+                nifti_pname,
+                self.dicom_archive.id,
+                self.json_file_dict,
+                str(self.nifti_path),
+                err_msg
+            )
+
+            log_error_exit(self.env, err_msg, lib.exitcode.FILENAME_MISMATCH)
+
+    def _check_if_nifti_file_was_already_inserted(self):
+        """
+        Ensures that the NIfTI file was not already inserted. It checks whether there is already a
+        file inserted into the files table with the same SeriesUID/EchoTime, as well as whether
+        there is a file inserted with the same md5 or blake2b hash.
+
+        Proper information will be logged into the log file, notification table and terminal.
+        """
+
+        error_msg = None
+        json_keys = self.json_file_dict.keys()
+        if self.json_file_dict and "SeriesInstanceUID" in json_keys and "EchoTime" in json_keys:
+            # verify that a file has not already be inserted with the same SeriesUID/EchoTime
+            # combination if SeriesInstanceUID and EchoTime have been set in the JSON side car file
+            echo_time = self.json_file_dict["EchoTime"]
+            series_uid = self.json_file_dict["SeriesInstanceUID"]
+            echo_nb = self.json_file_dict["EchoNumber"] if "EchoNumber" in json_keys else None
+            phase_enc_dir = self.json_file_dict["PhaseEncodingDirection"] \
+                if "PhaseEncodingDirection" in json_keys else None
+            match = self.imaging_obj.grep_file_info_from_series_uid_and_echo_time(
+                series_uid, echo_time, phase_enc_dir, echo_nb
+            )
+            if match:
+                error_msg = f"There is already a file registered in the files table with SeriesUID {series_uid}," \
+                            f" EchoTime {echo_time}, EchoNumber {echo_nb} and PhaseEncodingDirection {phase_enc_dir}." \
+                            f" The already registered file is {match['File']}"
+
+            # If force option has been used, check that there is no matching SeriesUID/EchoTime
+            # entry in tarchive_series
+            if self.force:
+                tar_echo_time = echo_time * 1000
+                dicom_archive_series = try_get_dicom_archive_series_with_series_uid_echo_time(
+                    self.env.db,
+                    series_uid,
+                    tar_echo_time
+                )
+
+                self.dicom_archive = dicom_archive_series.archive if dicom_archive_series is not None else None
+                if self.dicom_archive is not None:
+                    error_msg = f"Found a DICOM archive containing DICOM files with the same SeriesUID ({series_uid})" \
+                                f" and EchoTime ({tar_echo_time}) as the one present in the JSON side car file. " \
+                                f" The DICOM archive location containing those DICOM files is " \
+                                f" {self.dicom_archive.path}. Please, rerun " \
+                                f" <insert-nifti> with either --upload_id or --tarchive_path option."
+
+        # verify that a file with the same MD5 or blake2b hash has not already been inserted
+        md5_match = try_get_file_with_hash(self.env.db, self.nifti_md5)
+        blake2b_match = try_get_file_with_hash(self.env.db, self.nifti_blake2)
+        if md5_match is not None:
+            error_msg = f"There is already a file registered in the files table with MD5 hash {self.nifti_md5}." \
+                        f" The already registered file is {md5_match.path}"
+        elif blake2b_match is not None:
+            error_msg = f"There is already a file registered in the files table with Blake2b hash {self.nifti_blake2}."\
+                        f" The already registered file is {blake2b_match.path}"
+
+        if error_msg:
+            log_error_exit(self.env, error_msg, lib.exitcode.FILE_NOT_UNIQUE)
+
+    def _determine_acquisition_protocol(self):
+        """
+        Determines the acquisition protocol of the NIfTI file.
+
+        :return: identified acquisition protocol ID for the NIfTI file
+         :rtype: int
+        """
+
+        scan_param = self.json_file_dict
+
+        # get the list of lines in the mri_protocol table that apply to the given scan based on the
+        # protocol group
+        protocols_list = self.imaging_obj.get_list_of_eligible_protocols_based_on_session_info(
+            self.session.project_id,
+            self.session.cohort_id,
+            self.session.site_id,
+            self.session.visit_label,
+            self.mri_scanner.id,
+        )
+
+        protocol_info = self.imaging_obj.get_acquisition_protocol_info(
+            protocols_list, self.nifti_path.name, scan_param, self.loris_scan_type
+        )
+
+        log_verbose(self.env, protocol_info['error_message'])
+
+        return protocol_info['scan_type_id'], protocol_info['mri_protocol_group_id']
+
+    def _move_to_assembly_and_insert_file_info(self):
+        """
+        Determines where the NIfTI file and its associated files (.json, .bval, .bvec...) will go in
+        the assembly_bids directory, move the files and inserts the NIfTI file information into the
+        files/parameter_file tables.
+        If the image has 'warning' violations the violations will be inserted into the
+        mri_violations_table as well and the Caveat will be set to True in the files table.
+        """
+
+        # add TaskName to the JSON file if the file's BIDS scan type subcategory contains task-*
+        bids_subcategories = self.bids_categories_dict['BIDSScanTypeSubCategory']
+        if self.sidecar_json is not None and bids_subcategories and 'task-' in bids_subcategories:
+            # FIXME: This code writes data in the input files, this should be avoided.
+            self.sidecar_json.data['TaskName'] = re.search(r'task-([a-zA-Z0-9]*)', bids_subcategories).group(1)
+            with open(self.sidecar_json.path, 'w') as json_file:
+                json_file.write(json.dumps(self.sidecar_json.data, indent=4))
+
+        # determine the new file paths and move the files in assembly_bids
+        self.assembly_nifti_rel_path = self._determine_new_nifti_assembly_rel_path()
+        self._create_destination_dir_and_move_image_files('assembly_bids')
+
+        # register the files in the database (files and parameter_file tables)
+        self.file = self._register_into_files_and_parameter_file(self.assembly_nifti_rel_path)
+        log_verbose(
+            self.env,
+            f"Registered file {self.assembly_nifti_rel_path} into the files table with FileID {self.file.id}"
+        )
+
+        # add an entry in the violations log table if there is a warning violation associated to the
+        # file
+        if self.warning_violations_list:
+            log_verbose(self.env, (
+                f"Inserting warning violations related to {self.assembly_nifti_rel_path}."
+                f"  List of violations found: {self.warning_violations_list}"
+            ))
+
+            self._register_violations_log(self.warning_violations_list, self.assembly_nifti_rel_path)
+
+    def _determine_new_nifti_assembly_rel_path(self):
+        """
+        Determines the directory and the new NIfTI name of the file that will be moved into the
+        assembly folder.
+
+        :return: relative path to the new NIfTI file
+         :rtype: str
+        """
+
+        # determine file BIDS entity values for the file into a dictionary
+        file_bids_entities_dict = {
+            'sub': self.session.candidate.cand_id,
+            'ses': self.session.visit_label,
+            'run': 1
+        }
+        if self.bids_categories_dict['BIDSEchoNumber']:
+            file_bids_entities_dict['echo'] = self.bids_categories_dict['BIDSEchoNumber']
+        if self.bids_categories_dict['BIDSScanTypeSubCategory']:
+            subcategories_list = self.bids_categories_dict['BIDSScanTypeSubCategory'].split('_')
+            for subcategory in subcategories_list:
+                key, value = subcategory.split('-')
+                file_bids_entities_dict[key] = value
+
+        # determine where the file should go
+        bids_subfolder = self.bids_categories_dict['BIDSCategoryName']
+
+        # determine NIfTI file name
+        already_inserted_filenames = [file.path.name for file in self.session.files]
+        new_nifti_name = self._construct_nifti_filename(file_bids_entities_dict)
+        while new_nifti_name in already_inserted_filenames:
+            file_bids_entities_dict['run'] += 1
+            new_nifti_name = self._construct_nifti_filename(file_bids_entities_dict)
+
+        relative_path = build_bids_modality_path(
+            str(self.session.candidate.cand_id),
+            self.session.visit_label,
+            bids_subfolder,
+            new_nifti_name,
+        )
+
+        return os.path.join('assembly_bids', relative_path)
+
+    def _construct_nifti_filename(self, file_bids_entities_dict):
+        """
+        Determines the name of the NIfTI file according to what is present in the
+        bids_mri_scan_type_rel table.
+
+        :param file_bids_entities_dict: dictionary with the BIDS entities grepped from the
+                                        bids_mri_scan_type_rel table
+         :type file_bids_entities_dict: str
+
+        :return: name of the NIfTI to be inserted
+         :rtype: str
+        """
+
+        suffix = self.bids_categories_dict['BIDSScanType']
+        entities = dict(file_bids_entities_dict)
+        if suffix == 'magnitude' and 'echo' in entities:
+            suffix = f"magnitude{entities.pop('echo')}"
+
+        nifti_ext = get_path_extension(self.nifti_path)
+        if nifti_ext is None:
+            log_error_exit(
+                self.env,
+                f"Missing NIfTI extension in file name: {self.nifti_path}"
+            )
+
+        return build_bids_file_name(entities, suffix, nifti_ext)
+
+    def _move_to_trashbin(self):
+        """
+        Determine where the NIfTI file will go under the trashbin directory and move the file there.
+        """
+        self.trashbin_nifti_rel_path = os.path.join(
+            'trashbin',
+            re.sub(r'\.log', '', self.env.log_file_path.name),
+            os.path.basename(self.nifti_path)
+        )
+        self._create_destination_dir_and_move_image_files('trashbin')
+
+    def _create_destination_dir_and_move_image_files(self, destination):
+        """
+        Create the destination directory for the files and move the NIfTI file and its associated
+        files there.
+
+        :param destination: destination root directory (one of 'assembly_bids' or 'trashbin')
+         :type destination: str
+        """
+        nii_rel_path = self.assembly_nifti_rel_path if destination == 'assembly_bids' else self.trashbin_nifti_rel_path
+        json_rel_path = re.sub(r"\.nii(\.gz)?$", '.json', nii_rel_path) if self.sidecar_json is not None else None
+        bval_rel_path = re.sub(r"\.nii(\.gz)?$", '.bval', nii_rel_path) if self.bval_path else None
+        bvec_rel_path = re.sub(r"\.nii(\.gz)?$", '.bvec', nii_rel_path) if self.bvec_path else None
+
+        absolute_dir_path = os.path.join(self.data_dir, os.path.dirname(nii_rel_path))
+        self.create_dir(absolute_dir_path)
+
+        file_type_to_move_list = [
+            {
+                'original_file_path': self.nifti_path,
+                'new_file_path': os.path.join(self.data_dir, nii_rel_path)
+            }
+        ]
+        if self.sidecar_json is not None:
+            file_type_to_move_list.append(
+                {
+                    'original_file_path': self.sidecar_json.path,
+                    'new_file_path': os.path.join(self.data_dir, json_rel_path)
+                }
+            )
+        if self.bval_path:
+            file_type_to_move_list.append(
+                {
+                    'original_file_path': self.bval_path,
+                    'new_file_path': os.path.join(self.data_dir, bval_rel_path)
+                }
+            )
+        if self.bvec_path:
+            file_type_to_move_list.append(
+                {
+                    'original_file_path': self.bvec_path,
+                    'new_file_path': os.path.join(self.data_dir, bvec_rel_path)
+                }
+            )
+
+        for file_dict in file_type_to_move_list:
+            original_file_path = file_dict['original_file_path']
+            new_file_path = file_dict['new_file_path']
+
+            log_verbose(self.env, f"Moving file {original_file_path} to {new_file_path}")
+
+            self.move_file(original_file_path, new_file_path)
+
+        if destination == 'assembly_bids':
+            self.json_file_dict['file_blake2b_hash'] = self.nifti_blake2
+            if self.sidecar_json is not None:
+                self.json_file_dict['bids_json_file'] = json_rel_path
+                self.json_file_dict['bids_json_file_blake2b_hash'] = self.json_blake2
+            if self.bval_path:
+                self.json_file_dict['check_bval_filename'] = bval_rel_path
+                self.json_file_dict['check_bval_filename_blake2b_hash'] = self.bval_blake2
+            if self.bvec_path:
+                self.json_file_dict['check_bvec_filename'] = bvec_rel_path
+                self.json_file_dict['check_bvec_filename_blake2b_hash'] = self.bvec_blake2
+
+    def _register_protocol_violated_scan(self):
+        """
+        Register a file with unknown protocol into mri_protocol_violated_scans.
+        """
+
+        patient_name = None
+        if "PatientName" in self.json_file_dict.keys():
+            patient_name = self.json_file_dict["PatientName"]
+        elif self.dicom_archive is not None:
+            patient_name = self.dicom_archive.patient_name
+
+        self.imaging_obj.insert_protocol_violated_scan(
+            patient_name,
+            self.session.candidate.cand_id,
+            self.session.candidate.psc_id,
+            self.dicom_archive.id,
+            self.json_file_dict,
+            self.trashbin_nifti_rel_path,
+            self.mri_protocol_group_id
+        )
+
+    def _register_mri_candidate_errors(self):
+
+        patient_name = None
+        if "PatientName" in self.json_file_dict.keys():
+            patient_name = self.json_file_dict["PatientName"]
+        elif self.dicom_archive is not None:
+            patient_name = self.dicom_archive.patient_name
+
+        self.imaging_obj.insert_mri_candidate_errors(
+            patient_name
+        )
+
+    def _register_violations_log(self, violations_list, file_rel_path):
+        """
+        Register the list of violations into the mri_violations_log table (one row per violation
+        listed in violations_list).
+
+        :param violations_list: list of violations to be inserted into mri_violations_log
+         :type violations_list: list
+        :param file_rel_path: file relative path (in assembly_bids or trashbin depending on the
+                              violation's severity)
+         :type file_rel_path: str
+        """
+        scan_param = self.json_file_dict
+        phase_enc_dir = scan_param['PhaseEncodingDirection'] if 'PhaseEncodingDirection' in scan_param.keys() else None
+        base_info_dict = {
+            'TimeRun': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'SeriesUID': scan_param['SeriesInstanceUID'] if 'SeriesInstanceUID' in scan_param.keys() else None,
+            'TarchiveID': self.dicom_archive.id,
+            'MincFile': file_rel_path,
+            'PatientName': self.json_file_dict['PatientName'],
+            # C-BIG OVERRIDE START
+            # Remove when updating to LORIS 27
+            'CandID': self.session.candidate.cand_id,
+            # C-BIG OVERRIDE END
+            'Visit_label': self.session.visit_label,
+            # C-BIG OVERRIDE START
+            # Remove when updating to LORIS 27
+            'Scan_type': self.scan_type.id,
+            # C-BIG OVERRIDE END
+            'EchoTime': scan_param['EchoTime'] if 'EchoTime' in scan_param.keys() else None,
+            'EchoNumber': scan_param['EchoNumber'] if 'EchoNumber' in scan_param.keys() else None,
+            'PhaseEncodingDirection': phase_enc_dir,
+            'MriProtocolChecksGroupID': self.mri_protocol_group_id
+        }
+        for violation_dict in violations_list:
+            info_to_insert_dict = base_info_dict | violation_dict
+            self.imaging_obj.insert_mri_violations_log(info_to_insert_dict)
+
+    def _register_into_files_and_parameter_file(self, nifti_rel_path):
+        """
+        Registers the image into files and file_parameter via the lib.imaging library.
+
+        :param nifti_rel_path: relative path to the imaging file to use for the File column of the
+                               files table
+         :type nifti_rel_path: str
+
+        :return: file of the inserted image
+        """
+
+        scan_param = self.json_file_dict
+        acquisition_date = None
+        if "AcquisitionDateTime" in scan_param.keys():
+            acquisition_date = datetime.datetime.strptime(
+                scan_param['AcquisitionDateTime'], '%Y-%m-%dT%H:%M:%S.%f'
+            ).date()
+        file_type = get_check_bids_imaging_file_type_from_extension(self.env, Path(nifti_rel_path))
+
+        file = register_mri_file(
+            self.env,
+            Path(nifti_rel_path),
+            file_type,
+            self.session,
+            None,
+            self.scan_type,
+            self.mri_scanner,
+            self.dicom_archive,
+            scan_param.get('SeriesInstanceUID'),
+            scan_param.get('EchoTime'),
+            scan_param.get('EchoNumber'),
+            scan_param.get('PhaseEncodingDirection'),
+            acquisition_date,
+            len(self.warning_violations_list) != 0,
+        )
+
+        register_mri_file_parameters(self.env, file, scan_param)
+
+        self.env.db.commit()
+
+        return file
+
+    def _run_push_to_s3_pipeline(self):
+        """
+        Run push to S3 script to upload data to S3. This function is called only when the file path
+        to insert provided to the script is an S3 URL.
+        """
+
+        push_to_s3_cmd = [
+            "push-imaging-files-to-s3",
+            "-u", str(self.mri_upload.id),
+        ]
+        if self.options_dict["profile"]["value"] is not None:
+            push_to_s3_cmd.extend(['-p', self.options_dict["profile"]["value"]])
+        if self.verbose:
+            push_to_s3_cmd.append("-v")
+
+        s3_process = subprocess.Popen(push_to_s3_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        stdout, _ = s3_process.communicate()
+
+        if s3_process.returncode == 0:
+            log_verbose(
+                self.env,
+                f"push-imaging-files-to-s3 successfully executed for Upload ID {self.mri_upload.id}"
+            )
+        else:
+            log_verbose(
+                self.env,
+                f"push-imaging-files-to-s3 failed for Upload ID {self.mri_upload.id}.\n{stdout}"
+            )
