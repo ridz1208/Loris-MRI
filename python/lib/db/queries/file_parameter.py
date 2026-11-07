@@ -10,7 +10,7 @@ def delete_file_parameter(db: Database, file_parameter_id: int):
     Delete from the database a parameter value based on a file ID and parameter ID.
     """
 
-    db.execute(delete(DbFileParameter)
+    return db.execute(delete(DbFileParameter)
         .where(DbFileParameter.id == file_parameter_id))
 
 

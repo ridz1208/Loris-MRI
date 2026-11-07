@@ -55,7 +55,6 @@ def try_get_file_with_hash(db: Database, file_hash: str) -> DbFile | None:
     Get an imaging file from the database using its BLAKE2b or MD5 hash, or return `None` if no
     imaging file is found.
     """
-
     return db.execute(select(DbFile)
         .join(DbFile.parameters)
         .join(DbFileParameter.type)
